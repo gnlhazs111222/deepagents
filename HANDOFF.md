@@ -77,6 +77,13 @@ agentseek doctor --live   # 另开终端验证服务在线
 
 - 重装前端依赖（换 node/npm 后需要）：`rm -rf frontend/node_modules && agentseek task frontend`
 - 后端依赖：`UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple agentseek task sync`
+- **改 `.env`（模型 / key / base 地址）后必须重启 `agentseek dev` 才生效**：模型配置在进程启动时读死（`src/research_deepagent/agent.py` 模块导入时 `load_dotenv()` 并构造模型客户端），uvicorn 的 `--reload` 只监听 `.py` 文件，不监听 `.env`。
+- **Ctrl+C 停不掉后端**：`agentseek dev` 被中断时只杀了父进程和前端 vite（5174），2024 后端与 SeekDB 是守护化子进程会残留，且仍带旧配置。彻底重启：
+  ```bash
+  pkill -f agentseek-api; pkill -f agentseek_api.runtime_entrypoint; pkill -f pylibseekdb/seekdb
+  agentseek dev
+  ```
+  （2026-10-15 踩过：半重启后浏览器 5174"拒绝连接"，后端仍报旧模型的 403 免费额度错误。）
 
 ## 8. 已知问题与无关紧要的噪音
 
