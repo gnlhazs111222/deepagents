@@ -87,6 +87,8 @@ agentseek doctor --live   # 另开终端验证服务在线
 
 ## 8. 已知问题与无关紧要的噪音
 
+- **DashScope 免费额度按模型单独计算、有有效期**：控制台总览"有额度"≠ 当前模型有额度。一次完整 research（3 个并行子代理 × 多轮迭代 × 长系统提示）消耗 token 很大，昨晚验证可用的模型第二天就可能 403 `AllocationQuota.FreeTierOnly`。处理：百炼控制台查该模型的剩余免费额度 → 充值转按量付费 / 关闭"仅免费模式" / 换仍有免费额度的模型（改 `.env` 后记得重启，见 §7）。
+- **Tavily 偶发 `ConnectionResetError(104)`**：境外端点、WSL 未走代理，搜索请求偶发被重置；单发实测通常正常，重跑研究即可。若频繁出现，走 §4 的代理方案（代理软件开 Allow LAN + 宿主机 IP）。
 - 后端启动时打印 `SHOW FULL TABLES ... unsupported syntax. Falling back` —— SeekDB 初始化的无害警告，忽略；
 - `[sample_graphs] skipped xxx: No module named 'graphs'` —— 无害，忽略；
 - LangSmith Studio 顶部"Upgrade your agent server"黄条 —— 版本提示，忽略；
@@ -103,4 +105,47 @@ agentseek doctor --live   # 另开终端验证服务在线
 
 - **pre02 技能安装已完成**：`langchain-dev-guide`、`langsmith-trace` 已由 skills CLI 装入 `.agents/skills/`（含 `skills-lock.json`），`.claude/skills/` 有软链接；ZCode 原生读取 `.agents/skills/`，两个技能在 ZCode 会话中已生效。
 - **交接文档本身已存入 WSL 项目**（本文件），后续以此文件为准。
+- **模型已切换为智谱 `glm-4.5-air`**（`OPENAI_API_BASE=https://open.bigmodel.cn/api/paas/v4`，付费档、价格低、无免费档限流问题）：百炼 `qwen3.7-flash` 免费额度耗尽；曾短暂用智谱免费 `glm-4.7-flash`（高峰会报 `1305 访问量过大`）。旧百炼配置以注释形式保留在 `.env`，可随时切回。注意：智谱**编程套餐**的 key 走 `coding/paas` 专用端点，通用调用要用开放平台**普通 API key**。
 - 待办 3/4 执行结果见本节追加。
+
+---
+
+## 11. 2026-10-15 增补（概念学习会话：上下文与存储机制）
+
+本次为纯概念学习会话，**无代码改动**。围绕"research 一次运行中到底发生了什么"追问到底，以下定稿可作为后续章节的学习底座。
+
+### 11.1 三段式总结（定稿）
+
+> **上下文**就是每次调用大模型时**全量塞给它**的一个按 JSON 格式写的数组。每个元素是一条消息，用 `role` 标明说话人（四种）：`system` 是开发者预设的规则，`user` 是用户说的话，`assistant` 是模型的发言（文字回答或调工具指令），`tool` 是工具执行结果（必须紧跟在调工具的 assistant 后面）。数组按"规则→用户问→模型下令→工具交差→…→模型收尾"排列，每轮原样重发，发完把本轮新消息追加回去，越聊越长。
+>
+> **Context Engineering** 就是控制这个数组别太长，三道手段：**① 事前预防**——调优系统提示词，从源头教模型省着用；**② 事中分流**——工具结果过大小安检（阈值约 2 万 token），超长全文转存 state 的 files 仓库，数组里只留一张纸条（路径+首尾各5行+行号），模型按需 `read_file` 取回；**③ 事后兜底**——数组总长达到模型窗口 85% 时，旧行压缩成结构化摘要（保留意图、结论、文件路径），原文仍在 state。压缩 = 触发（代码数长度）→ 概括（一次普通 LLM 调用 + 框架内置摘要模板）→ 替换（代码改数组），模型只参与中间一步。
+>
+> **state** 是框架装配时定义好的三键字典（不是每轮生成）：`messages`（上下文的内存形态，不断追加）、`todos`（任务清单，调 write_todos 时**全量替换**）、`files`（原文仓库，永不进上下文）。每执行**一步**（不论有无更新），checkpointer 都把内存中的 state 快照**写入**磁盘上的 SeekDB 用于断点恢复；重开会话时再把快照**加载**回内存。
+
+### 11.2 关键澄清（容易回错的点）
+
+- **SeekDB 是"摄影师"不是"档案室"**：长文的"家"是内存 state 的 files 键；SeekDB 每步给整个 state 拍快照，只整存整取，不支持按内容检索。grep 是在内存字典的 files 上跑匹配，不查数据库。
+- **两处"替换"都是代码干的**：大结果落盘换纸条（`awrap_tool_call` 拦截，结果从未进过上下文）、85% 摘要换旧行（`awrap_model_call` 重写数组）。LLM 只在被要求时产文本。
+- **子代理没有 todos**：默认子代理中间件栈不含 TodoListMiddleware（`graph.py:667`），且 `_EXCLUDED_STATE_KEYS = {messages, todos, structured_response}`（`subagents.py:252`）双向隔离。files 不在排除清单——这是子代理能读任务书的原因。
+- **快照粒度**：主图每执行一步一张（一条用户消息引爆几十张）；子代理内部无快照（没挂 checkpointer）。
+- **todo 是"单一当前版 + 全量替换 + 历史可回溯"**（messages 里历次调用记录都在）。
+- **grep 只搜 files，不搜 messages/todos**——把重要结论写成文件 = 搬进"可检索层"，这是"报告先写 /final_report.md"流程的深层原因。
+- **临时/长期的分界是作用域不是介质**：StateBackend 也落盘（快照）、StoreBackend 也过内存；区别是"跟线程存亡"vs"跨线程常驻"。
+
+### 11.3 源码定位速查（deepagents 0.7.8 / langchain 1.4.3 / langgraph）
+
+| 概念 | 位置 |
+|---|---|
+| `write_todos` 工具 | `langchain/agents/middleware/todo.py:139`（中间件 `:174`） |
+| `task` 工具（子代理） | `deepagents/middleware/subagents.py:542` |
+| 大结果落盘 | `deepagents/middleware/filesystem.py:1626`（阈值默认 2 万 token）、`:1843`（检查）、`:3497`（awrap_tool_call） |
+| 纸条模板 / 预览 | `deepagents/middleware/_message_eviction.py`（TOO_LARGE_TOOL_MSG、`_create_content_preview` 头尾各5行） |
+| 85% 摘要触发 | `deepagents/middleware/summarization.py:34`；提示词模板 `langchain/agents/middleware/summarization.py:40` |
+| agent 循环装配 | `langchain/agents/factory.py:1611-1615`（model/tools 两节点）；`bind_tools` `:1454` |
+| ToolNode | `langgraph/prebuilt/tool_node.py:622` |
+| 默认 backend | `deepagents/graph.py:627`（不传即 StateBackend）；子代理默认栈 `:667`（无 Todo） |
+| 路由分拣 | `deepagents/backends/composite.py`（`_route_for_path`，纯前缀匹配）；namespace 按用户身份分格 |
+
+### 11.4 决议：长期记忆等后续章节
+
+StoreBackend/CompositeBackend 已理解到"换零件 + 写规矩"三步（配置路由、提示词分区规范、持久化 Store 接 SeekDB），但**暂不动手**，等课程后续章节展开。与 §9 的"语义记忆/RAG"未来项衔接：朴素版长期记忆只差配置与提示词纪律，向量检索那层才需要另起炉灶。
